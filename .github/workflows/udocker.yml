@@ -1,0 +1,86 @@
+name: Build and Release udocker Image Tar
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate unique build tag
+        id: tag
+        run: |
+          TAG="udocker-$(date -u +'%Y%m%d-%H%M%S')"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image for ARM64
+        run: |
+          # Build specifically for linux/arm64 to match Termux on Android devices
+          docker buildx build \
+            --platform linux/arm64 \
+            --tag app-image:${{ steps.tag.outputs.tag }} \
+            --load \
+            .
+
+      - name: Save Docker image to TAR
+        run: |
+          TAR_NAME="app-image-${{ steps.tag.outputs.tag }}.tar"
+          docker save app-image:${{ steps.tag.outputs.tag }} -o "$TAR_NAME"
+          ls -lh "$TAR_NAME"
+          echo "tar_name=$TAR_NAME" >> "$GITHUB_ENV"
+
+      - name: Create tag for this commit
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/git/refs \
+            -f ref="refs/tags/${{ steps.tag.outputs.tag }}" \
+            -f sha="${{ github.sha }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "udocker Build ${{ steps.tag.outputs.tag }} (${{ steps.tag.outputs.short_sha }})"
+          body: |
+            Automated udocker-compatible build from commit ${{ github.sha }} on `main`.
+            Built for **linux/arm64** (Termux on Android).
+
+            **Load in Termux:**
+            ```bash
+            udocker load -i ${{ env.tar_name }}
+            ```
+          files: ${{ env.tar_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send ntfy Notification
+        if: success()
+        run: |
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }}"
+          DIRECT_DL_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/${{ env.tar_name }}"
+
+          curl -fsS -X POST \
+            -H "Title: New udocker Image: ${{ steps.tag.outputs.tag }}" \
+            -H "Priority: default" \
+            -H "Tags: package,whale" \
+            -H "Click: $RELEASE_URL" \
+            -H "Actions: view, Download TAR, $DIRECT_DL_URL, clear=true" \
+            -d "udocker image for Termux (arm64) ready. Direct download: $DIRECT_DL_URL" \
+            https://ntfy.sh/az_alerts
